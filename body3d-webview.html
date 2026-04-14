@@ -955,10 +955,10 @@ controls.addEventListener('end', () => { userTouching = false; setTimeout(() => 
       _camTarget = null;
     }
   }
-  // Gentle auto-rotate when idle
+  // Gentle auto-rotate when idle (constant distance, circular orbit)
   else if (autoRotate && _dist) {
     const t = performance.now() * 0.00006;
-    camera.position.x = Math.sin(t) * _dist * 0.25;
+    camera.position.x = Math.sin(t) * _dist;
     camera.position.z = Math.cos(t) * _dist;
     camera.position.y = _midY;
     controls.target.set(0, _midY, 0);
