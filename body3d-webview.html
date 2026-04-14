@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Anatomical Muscle Viewer</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background:#080810; overflow:hidden; font-family:'Segoe UI',sans-serif; }
+    canvas { display:block; }
+    #loading {
+      position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+      color:#00E5FF; font-size:11px; letter-spacing:3px; text-align:center; line-height:2;
+    }
+  </style>
+</head>
+<body>
+<div id="loading">LADDAR ECORCHE-MODELL...</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// == Renderer ================================================================
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+document.body.appendChild(renderer.domElement);
+
+const scene  = new THREE.Scene();
+scene.background = new THREE.Color(0x080810);
+
+const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.01, 100);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance   = 0.3;
+controls.maxDistance   = 10;
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// == Lighting -- multi-source for muscle definition =========================
+const amb = new THREE.AmbientLight(0x4466aa, 2.0);
+scene.add(amb);
+
+const key = new THREE.DirectionalLight(0xddeeff, 4.0);
+key.position.set(2, 3, 5);
+scene.add(key);
+
+const fill = new THREE.DirectionalLight(0x6688cc, 2.5);
+fill.position.set(-3, 2, 2);
+scene.add(fill);
+
+const rim = new THREE.DirectionalLight(0x4466bb, 1.8);
+rim.position.set(0, 2, -4);
+scene.add(rim);
+
+const top = new THREE.DirectionalLight(0xaabbdd, 1.5);
+top.position.set(0, 6, 0);
+scene.add(top);
+
+const bot = new THREE.DirectionalLight(0x334466, 1.0);
+bot.position.set(0, -3, 2);
+scene.add(bot);
+
+const rakeL = new THREE.DirectionalLight(0x88aacc, 1.5);
+rakeL.position.set(3, 1.1, 3);
+scene.add(rakeL);
+const rakeR = new THREE.DirectionalLight(0x88aacc, 1.2);
+rakeR.position.set(-3, 1.1, 3);
+scene.add(rakeR);
+
+// == Materials ==============================================================
+const baseMat = new THREE.MeshPhysicalMaterial({
+  color: 0x4a6a90,
+  roughness: 0.42,
+  metalness: 0.02,
+  clearcoat: 0.15,
+  clearcoatRoughness: 0.4,
+  side: THREE.DoubleSide,
+});
+
+// == Mesh-to-group mapping ==================================================
+//
+// Anatomical study (April 2026, verified with Test2.glb visual inspection):
+//   Object_3:  Gluteus maximus                    cy 0.95, posterior hip
+//   Object_5:  Deltoids (ant/lat/post)            cy 1.43  → SPLIT 3-way
+//   Object_7:  Gastrocnemius (posterior calf)      cy 0.29, posterior lower leg
+//   Object_9:  Hamstrings (posterior thigh)        cy 0.69, posterior thigh
+//   Object_11: SKELETON                            → hidden
+//   Object_13: Back muscles (traps+lats combined)  → SPLIT via sub-meshes (Object_13xxx)
+//   Object_15: Head/face                           → hidden (cosmetic)
+//   Object_17: Quadriceps (anterior thigh)         cy 0.73, anterior thigh (large, 16k verts)
+//   Object_19: Neck muscles (SCM, platysma)        → cosmetic, no group
+//   Object_21: Hands/fingers                       → hidden (not a trainable muscle group)
+//   Object_23: Front torso (pecs+abs+serratus)     → SPLIT via sub-meshes (Object_23xxx)
+//   Object_25: Tibialis anterior / shins / feet    cy 0.26, anterior lower leg
+//   Object_27: Adductors (inner thigh)             cy 0.72, medial thigh (narrower, 8k verts)
+//   Object_29: SKELETON                            → hidden
+//   Object_31: Forearms + hands                    → forearms group
+//   Object_33: Upper arms (biceps+triceps)         → SPLIT into biceps/triceps
+//   Cube:      Blender artifact                    → hidden
+//
+const MESH_GROUP_MAP = {
+  'Object_3':  'glutes',            // gluteus maximus
+  'Object_5':  null,                // deltoids → SPLIT into front/side/rear
+  'Object_7':  'calves_gastroc',    // gastrocnemius (posterior calf)
+  'Object_9':  'hamstrings',        // hamstrings (posterior thigh)
+  'Object_11': null,                // SKELETON → hidden
+  'Object_13': null,                // back muscles → SPLIT into lats/traps_lower/traps_upper
+  'Object_15': null,                // head/face → cosmetic, no group
+  'Object_17': 'quads',             // quadriceps (anterior thigh, large mesh)
+  'Object_19': null,                // neck (SCM, platysma etc) → cosmetic only
+  'Object_21': null,                // hands/fingers → hidden
+  'Object_23': null,                // front torso → SPLIT into abs/chest_lower/chest_upper
+  'Object_23_abs': null,            // front torso abs (split from Object_23)
+  'Object_23_chest': null,          // front torso chest (split from Object_23)
+  'Object_25': 'calves_tibialis',   // tibialis anterior / shins / feet
+  'Object_27': 'adductors',         // adductors (inner thigh, narrower mesh)
+  'Object_29': null,                // SKELETON → hidden
+  'Object_31': null,                 // forearms → SPLIT into brachioradialis/forearms
+  'Object_33': null,                // upper arms → SPLIT into biceps/triceps
+};
+
+const SKELETON_NAMES = ['Object_11', 'Object_29', 'Object_21', 'Cube'];
+
+// Meshes that need vertex-level splitting or vertex-color reading
+const SPLIT_MESHES = new Set(['Object_23', 'Object_23_abs', 'Object_23_chest', 'Object_33', 'Object_5', 'Object_13', 'Object_31']);
+
+// Pattern-match sub-meshes split in Blender (Object_13001, Object_23015, etc.)
+function isSplitMesh(name) {
+  if (SPLIT_MESHES.has(name)) return true;
+  return /^Object_(13|23)\d{3,}$/.test(name);
+}
+
+// == Muscle group hierarchy =================================================
+// Maps main button -> sub-group keys (which correspond to mesh group tags)
+//
+// Anatomical sub-groups based on deep study:
+//   CHEST:      Clavicular head (upper) / Sternocostal head (lower)
+//   DELTS:      Anterior / Lateral / Posterior
+//   TRAPS:      Upper (C1-C7 + neck) / Lower (T1-T12, includes mid-traps)
+//   TRICEPS:    Single mesh region (long+lateral+medial not separable by axis)
+//   BICEPS:     Single mesh region (long+short head not separable by axis)
+//   FOREARMS:   Flexors + extensors combined (single mesh)
+//   LATS:       Latissimus dorsi (lower back)
+//   CORE:       Rectus abdominis (abs) — obliques included in abs region
+//   QUADS:      Rectus femoris + vastus group (bilateral = no clean X split)
+//   HAMSTRINGS: Biceps femoris + semitendinosus + semimembranosus (bilateral)
+//   GLUTES:     Gluteus maximus + adductors (inner thigh)
+//   CALVES:     Gastrocnemius (posterior) / Tibialis anterior (anterior)
+//
+const MUSCLE_HIERARCHY = {
+  chest:      { label:'BROST',      subs:['chest_upper','chest_lower'],             subLabels:['OVRE BROST','NEDRE BROST'] },
+  delts:      { label:'AXLAR',      subs:['delts_front','delts_side','delts_rear'], subLabels:['FRAMRE','SIDO','BAKRE'] },
+  traps:      { label:'TRAPS',      subs:['traps_upper','traps_lower'],             subLabels:['OVRE TRAPS','NEDRE TRAPS'] },
+  triceps:    { label:'TRICEPS',    subs:['triceps'],                               subLabels:['TRICEPS'] },
+  biceps:     { label:'BICEPS',     subs:['biceps'],                                subLabels:['BICEPS'] },
+  forearms:   { label:'UNDERARMAR', subs:['forearms','brachioradialis'],             subLabels:['UNDERARM','BRACHIORADIALIS'] },
+  lats:       { label:'RYGG',       subs:['lats'],                                  subLabels:['LATS'] },
+  abs:        { label:'CORE',       subs:['abs'],                                   subLabels:['ABS'] },
+  quads:      { label:'QUADS',      subs:['quads'],                                 subLabels:['QUADS'] },
+  hamstrings: { label:'HAMSTRINGS', subs:['hamstrings'],                            subLabels:['HAMSTRINGS'] },
+  glutes:     { label:'GLUTES',     subs:['glutes'],                                subLabels:['GLUTES'] },
+  adductors:  { label:'ADDUCTOR',  subs:['adductors'],                             subLabels:['ADDUCTOR'] },
+  calves:     { label:'VADER',      subs:['calves_gastroc','calves_tibialis'],       subLabels:['GASTROCNEMIUS','TIBIALIS'] },
+};
+
+// == State ==================================================================
+const activeSet      = new Set();   // active sub-group keys
+const activeGroups   = new Set();   // active main group keys
+const allMeshes      = [];          // { mesh, group, restMat, hidden? }
+window._dbg = { allMeshes, activeSet }; // debug access
+let defaultCamPos    = new THREE.Vector3();
+let defaultCamTarget = new THREE.Vector3();
+
+// == Colors per sub-group ===================================================
+const GROUP_COLORS = {
+  chest_upper:     new THREE.Color(0xFF4444),
+  chest_lower:     new THREE.Color(0xCC2020),
+  delts_front:     new THREE.Color(0xDD66FF),
+  delts_side:      new THREE.Color(0xBB44FF),
+  delts_rear:      new THREE.Color(0x8822CC),
+  triceps:         new THREE.Color(0xDDB800),
+  biceps:          new THREE.Color(0x15AA48),
+  forearms:        new THREE.Color(0x99993A),
+  brachioradialis: new THREE.Color(0xBBBB55),
+  lats:            new THREE.Color(0x00BBDD),
+  traps_upper:     new THREE.Color(0x00FFAA),
+  traps_lower:     new THREE.Color(0x00BB77),
+  abs:             new THREE.Color(0xDD7700),
+  quads:           new THREE.Color(0x0D88DD),
+  hamstrings:      new THREE.Color(0xE86430),
+  glutes:          new THREE.Color(0xAA1555),
+  adductors:       new THREE.Color(0xE04888),
+  calves_gastroc:  new THREE.Color(0x2ECC71),
+  calves_tibialis: new THREE.Color(0x00BCD4),
+};
+
+// == Render state ===========================================================
+// Dim material (shared, for non-active meshes)
+const dimMat = new THREE.MeshStandardMaterial({
+  color: 0x181e2a, roughness: 0.7, metalness: 0.0,
+  side: THREE.DoubleSide, transparent: true, opacity: 0.55,
+});
+
+function applyActiveState() {
+  const allOff = activeSet.size === 0;
+
+  for (const entry of allMeshes) {
+    if (entry.hidden) { entry.mesh.visible = false; continue; }
+    entry.mesh.visible = true;
+
+    // Blender vertex-color meshes: update colors per-vertex (PREFERRED path)
+    if (entry.isVertexPainted) {
+      const m = entry.mesh;
+      const vg = m._vertexGroups;
+      const colAttr = m.geometry.attributes.color;
+      const anyGroupActive = m._groupSet.some(g => activeSet.has(g));
+      const BASE_R = 0.29, BASE_G = 0.42, BASE_B = 0.56;
+      const DIM_R = 0.05, DIM_G = 0.06, DIM_B = 0.09;
+
+      if (allOff) {
+        for (let i = 0; i < vg.length; i++) colAttr.setXYZ(i, BASE_R, BASE_G, BASE_B);
+        m.material.transparent = false; m.material.opacity = 1.0;
+      } else if (anyGroupActive) {
+        const allGroupsActive = m._groupSet.every(g => activeSet.has(g));
+        for (let i = 0; i < vg.length; i++) {
+          const g = vg[i];
+          if (activeSet.has(g)) {
+            const c = GROUP_COLORS[g] || new THREE.Color(0x00E5FF);
+            colAttr.setXYZ(i, c.r, c.g, c.b);
+          } else {
+            colAttr.setXYZ(i, DIM_R, DIM_G, DIM_B);
+          }
+        }
+        if (allGroupsActive) {
+          m.material.transparent = false; m.material.opacity = 1.0;
+        } else {
+          m.material.transparent = true; m.material.opacity = 0.55;
+        }
+      } else {
+        for (let i = 0; i < vg.length; i++) colAttr.setXYZ(i, DIM_R, DIM_G, DIM_B);
+        m.material.transparent = true; m.material.opacity = 0.55;
+      }
+      colAttr.needsUpdate = true;
+      continue;
+    }
+
+    // Shader-region meshes (torso, back): update uniforms for per-pixel classification (FALLBACK)
+    if (entry.isShaderRegion) {
+      const m = entry.mesh;
+      const mat = m._regionMat;
+      const groups = m._regionGroups;
+      const u = mat._uniforms;
+      if (!u) continue;
+
+      const anyGroupActive = groups.some(g => activeSet.has(g));
+
+      if (allOff) {
+        u.uMode.value = 0;
+      } else if (anyGroupActive) {
+        u.uMode.value = 1;
+        for (let i = 0; i < groups.length; i++) {
+          const g = groups[i];
+          const c = GROUP_COLORS[g] || new THREE.Color(0x00E5FF);
+          u.uGroupColors.value[i].set(c.r, c.g, c.b);
+          u.uGroupActive.value[i] = activeSet.has(g) ? 1.0 : 0.0;
+        }
+      } else {
+        u.uMode.value = 2;
+      }
+      continue;
+    }
+
+    // Regular (non-vertex-painted) meshes: original material swap logic
+    if (allOff) {
+      entry.mesh.material = entry.restMat || baseMat;
+    } else if (entry.group && (
+      Array.isArray(entry.group) ? entry.group.some(g => activeSet.has(g)) : activeSet.has(entry.group)
+    )) {
+      const matchedGroup = Array.isArray(entry.group)
+        ? entry.group.find(g => activeSet.has(g))
+        : entry.group;
+      const col = GROUP_COLORS[matchedGroup] || new THREE.Color(0x00E5FF);
+      entry.mesh.material = new THREE.MeshStandardMaterial({
+        color: col, roughness: 0.38, metalness: 0.08,
+        side: THREE.DoubleSide, emissive: col, emissiveIntensity: 0.12,
+      });
+    } else {
+      entry.mesh.material = dimMat;
+    }
+  }
+}
+
+// == Sub-button panel =======================================================
+function updateSubButtons() {} // No UI in WebView mode
+
+// == Toggle a main group (activates/deactivates ALL its subs) ===============
+window.toggleGroup = function(gk) {
+  const hier = MUSCLE_HIERARCHY[gk];
+  if (!hier) return;
+  if (activeGroups.has(gk)) {
+    activeGroups.delete(gk);
+    hier.subs.forEach(s => activeSet.delete(s));
+  } else {
+    activeGroups.add(gk);
+    hier.subs.forEach(s => activeSet.add(s));
+  }
+  updateSubButtons();
+  applyActiveState();
+};
+
+// == Toggle a single sub-group within an already-active main group ==========
+function toggleSub(gk, subKey) {
+  if (activeSet.has(subKey)) {
+    activeSet.delete(subKey);
+  } else {
+    activeSet.add(subKey);
+  }
+  // Check if any sub in this group is still active
+  const hier = MUSCLE_HIERARCHY[gk];
+  const anyActive = hier.subs.some(s => activeSet.has(s));
+  if (!anyActive) {
+    activeGroups.delete(gk);
+  } else if (!activeGroups.has(gk)) {
+    activeGroups.add(gk);
+  }
+  updateSubButtons();
+  applyActiveState();
+}
+
+window.clearAll = function() {
+  activeSet.clear();
+  activeGroups.clear();
+  applyActiveState();
+};
+
+window.resetCam = function() {
+  camera.position.copy(defaultCamPos);
+  controls.target.copy(defaultCamTarget);
+  controls.update();
+};
+
+// Keep old toggleMuscle for console debugging
+window.toggleMuscle = function(key) {
+  if (MUSCLE_HIERARCHY[key]) { window.toggleGroup(key); return; }
+  if (activeSet.has(key)) activeSet.delete(key);
+  else activeSet.add(key);
+  applyActiveState();
+};
+
+// == Floor disc =============================================================
+function addFloor(y) {
+  const geo = new THREE.CircleGeometry(0.4, 64);
+  const mat2 = new THREE.MeshBasicMaterial({ color: 0x0d0d20, transparent: true, opacity: 0.7 });
+  const mesh = new THREE.Mesh(geo, mat2);
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.position.y = y;
+  scene.add(mesh);
+}
+
+// == Load the single ecorche model ==========================================
+const loader = new GLTFLoader();
+
+loader.load('Test2.glb', (gltf) => {
+  document.getElementById('loading').style.display = 'none';
+
+  const model = gltf.scene;
+
+  // Compute full model bounds
+  const box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+
+  // Normalize to ~1.85 units tall
+  const targetH = 1.85;
+  const scale = targetH / size.y;
+  model.scale.setScalar(scale);
+  model.updateMatrixWorld(true);
+
+  // Recompute after scaling
+  const box2 = new THREE.Box3().setFromObject(model);
+  const center2 = box2.getCenter(new THREE.Vector3());
+
+  // Center horizontally, feet at y=0
+  model.position.x -= center2.x;
+  model.position.z -= center2.z;
+  model.position.y -= box2.min.y;
+  model.updateMatrixWorld(true);
+
+  // Get final bounds
+  const finalBox = new THREE.Box3().setFromObject(model);
+  const finalH = finalBox.max.y - finalBox.min.y;
+
+  // == Multi-split: divide mesh into N regions along an axis ================
+  // thresholds sorted ascending, groupNames has length = thresholds.length + 1
+  // groupNames[0] = below first threshold, ..., groupNames[N] = above last threshold
+  function multiSplitMesh(mesh, axis, thresholds, groupNames) {
+    const geo = mesh.geometry;
+    const pos = geo.attributes.position;
+    const idx = geo.index;
+    const faceCount = idx ? idx.count / 3 : pos.count / 3;
+    const axisIdx = { x: 0, y: 1, z: 2 }[axis];
+
+    const worldV = new THREE.Vector3();
+    const vals = new Float32Array(pos.count);
+    for (let i = 0; i < pos.count; i++) {
+      worldV.set(pos.getX(i), pos.getY(i), pos.getZ(i));
+      mesh.localToWorld(worldV);
+      vals[i] = worldV.getComponent(axisIdx);
+    }
+
+    // Create bins for each region
+    const regionIndices = groupNames.map(() => []);
+
+    for (let f = 0; f < faceCount; f++) {
+      const a = idx ? idx.getX(f*3)   : f*3;
+      const b = idx ? idx.getX(f*3+1) : f*3+1;
+      const c = idx ? idx.getX(f*3+2) : f*3+2;
+      const avg = (vals[a] + vals[b] + vals[c]) / 3;
+
+      let region = 0;
+      for (let t = 0; t < thresholds.length; t++) {
+        if (avg >= thresholds[t]) region = t + 1;
+      }
+      regionIndices[region].push(a, b, c);
+    }
+
+    const results = [];
+    for (let r = 0; r < groupNames.length; r++) {
+      if (regionIndices[r].length === 0) continue;
+      const geoR = geo.clone();
+      geoR.setIndex(new THREE.BufferAttribute(new Uint32Array(regionIndices[r]), 1));
+      const meshR = new THREE.Mesh(geoR, baseMat.clone());
+      meshR.matrix.copy(mesh.matrix);
+      meshR.matrixAutoUpdate = false;
+      meshR.name = mesh.name + '_' + groupNames[r];
+      mesh.parent.add(meshR);
+      results.push({ mesh: meshR, group: groupNames[r], restMat: meshR.material });
+    }
+
+    mesh.visible = false;
+    return results;
+  }
+
+  // == Per-pixel shader-based region classification ==========================
+  // Uses GPU fragment shader to classify EACH PIXEL by its world-space
+  // position. This gives perfectly sharp boundaries at pixel level —
+  // no blurring, no jagged edges, no triangle dependency.
+  //
+  // How it works:
+  //   1. Vertex shader passes world position as a varying
+  //   2. Fragment shader runs the classifier per-pixel
+  //   3. Uniforms control which groups are active and their colors
+  //   4. Built on MeshPhysicalMaterial via onBeforeCompile → keeps PBR lighting
+
+  // ── GLSL classifier for front torso (Object_23) ────────────────
+  // Groups: 0=abs, 1=chest_lower, 2=chest_upper
+  //
+  // The pec is FAN-SHAPED: wide at the shoulder, narrow at the sternum.
+  // Its lower border curves UP dramatically toward the sides.
+  // We also use Z-depth: pec protrudes forward (high Z), abs are flatter.
+  //
+  //   Center (X=0):   pecBorder ≈ 1.22
+  //   Mid (X=0.12):   pecBorder ≈ 1.26
+  //   Side (X=0.23):  pecBorder ≈ 1.36
+  //
+  // Z correction: on the sides, if the surface is forward (high Z > 0.08),
+  // it's the pec shelf overhanging the abs → lower the border slightly.
+  const TORSO_GLSL = `
+    int classifyRegion(float y, float absX, float z, float ny) {
+      // Upper chest (clavicular head): above Y=1.35
+      if (y > 1.35) return 2;
+
+      // Pec lower border: gentle fan-shaped curve
+      // Center (X=0): Y=1.15   Side (X=0.25): Y=1.23
+      float xNorm = min(absX / 0.25, 1.0);
+      float pecBorder = 1.15 + xNorm * xNorm * 0.08;
+
+      if (y > pecBorder) return 1;  // chest_lower (sternocostal)
+      return 0;                      // abs / core
+    }
+  `;
+  const TORSO_GROUPS = ['abs', 'chest_lower', 'chest_upper'];
+
+  // ── GLSL classifier for back (Object_13) ───────────────────────
+  // Groups: 0=lats, 1=traps_lower, 2=traps_upper
+  const BACK_GLSL = `
+    int classifyRegion(float y, float absX, float z, float ny) {
+      if (y > 1.45) return 2;
+      if (y > 1.10) {
+        float t = (y - 1.10) / 0.35;
+        float trapHW = 0.02 + t * 0.14;
+        if (absX < trapHW) return 1;
+        return 0;
+      }
+      return 0;
+    }
+  `;
+  const BACK_GROUPS = ['lats', 'traps_lower', 'traps_upper'];
+
+  // Create a shader-enhanced material for per-pixel region classification
+  function createRegionMaterial(classifierGLSL, label) {
+    const mat = new THREE.MeshPhysicalMaterial({
+      color: 0x4a6a90,
+      roughness: 0.42, metalness: 0.02,
+      clearcoat: 0.15, clearcoatRoughness: 0.4,
+      side: THREE.DoubleSide,
+      transparent: true,
+    });
+
+    // Create uniforms UPFRONT (before shader compilation) so applyActiveState
+    // can set values immediately. onBeforeCompile just references these same objects.
+    mat._uniforms = {
+      uGroupColors: {
+        value: [new THREE.Vector3(0.29,0.42,0.56),
+                new THREE.Vector3(0.29,0.42,0.56),
+                new THREE.Vector3(0.29,0.42,0.56)]
+      },
+      uGroupActive: { value: [0.0, 0.0, 0.0] },
+      uMode:        { value: 0 },
+      uBaseColor:   { value: new THREE.Vector3(0.29, 0.42, 0.56) },
+      uDimColor:    { value: new THREE.Vector3(0.05, 0.06, 0.09) },
+    };
+
+    mat.onBeforeCompile = (shader) => {
+      // Merge pre-created uniforms into the shader (same object references)
+      Object.assign(shader.uniforms, mat._uniforms);
+
+      // Vertex: pass world position + world normal
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <common>',
+        '#include <common>\nvarying vec3 vWorldPos;\nvarying vec3 vWorldNorm;'
+      );
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <worldpos_vertex>',
+        `#include <worldpos_vertex>
+         vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+         vWorldNorm = normalize(mat3(modelMatrix) * objectNormal);`
+      );
+
+      // Fragment: inject classifier + color override
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <common>',
+        `#include <common>
+         varying vec3 vWorldPos;
+         varying vec3 vWorldNorm;
+         uniform vec3 uGroupColors[3];
+         uniform float uGroupActive[3];
+         uniform int uMode;
+         uniform vec3 uBaseColor;
+         uniform vec3 uDimColor;
+         ${classifierGLSL}`
+      );
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+         {
+           int region = classifyRegion(vWorldPos.y, abs(vWorldPos.x), vWorldPos.z, vWorldNorm.y);
+           if (uMode == 0) {
+             diffuseColor.rgb = uBaseColor;
+             diffuseColor.a = 1.0;
+           } else if (uMode == 2) {
+             diffuseColor.rgb = uDimColor;
+             diffuseColor.a = 0.55;
+           } else {
+             bool isActive = false;
+             if (region == 0) isActive = uGroupActive[0] > 0.5;
+             else if (region == 1) isActive = uGroupActive[1] > 0.5;
+             else isActive = uGroupActive[2] > 0.5;
+             if (isActive) {
+               diffuseColor.rgb = (region == 0) ? uGroupColors[0]
+                                : (region == 1) ? uGroupColors[1]
+                                : uGroupColors[2];
+               diffuseColor.a = 1.0;
+             } else {
+               diffuseColor.rgb = uBaseColor;
+               diffuseColor.a = 1.0;
+             }
+           }
+         }`
+      );
+    };
+    mat.customProgramCacheKey = () => 'regionShader_' + label;
+    return mat;
+  }
+
+  // Set up a mesh with per-pixel shader region classification (FALLBACK)
+  function setupShaderRegion(mesh, classifierGLSL, groupNames, label) {
+    const mat = createRegionMaterial(classifierGLSL, label);
+    mesh.material = mat;
+    mesh._regionGroups = groupNames;
+    mesh._regionMat = mat;
+
+    return {
+      mesh,
+      group: groupNames,
+      restMat: mat,
+      isShaderRegion: true,
+    };
+  }
+
+  // == Blender vertex-color based classification (PREFERRED) ==================
+  // If the GLB was exported with painted vertex colors from Blender,
+  // use those for PERFECT muscle group classification.
+  //
+  // Paint convention (dominant channel = group):
+  //   Object_23 (torso):  Red=chest_upper  Green=chest_lower  Blue=abs
+  //   Object_13 (back):   Red=traps_upper  Green=traps_lower  Blue=lats
+  //
+  // In Blender: Vertex Paint mode → paint each muscle region with one of
+  // the three colors. Export as GLB with "Vertex Colors" checked.
+
+  function readBlenderVertexColors(mesh, groupNames) {
+    const geo = mesh.geometry;
+    // GLB vertex colors come as 'color' attribute (COLOR_0)
+    const colorAttr = geo.attributes.color;
+    if (!colorAttr) return null;
+
+    // Check if colors are actually painted (not all default white/gray)
+    // Sample a few vertices to see if there's real color variation
+    let hasR = false, hasG = false, hasB = false;
+    const sampleStep = Math.max(1, Math.floor(colorAttr.count / 200));
+    for (let i = 0; i < colorAttr.count; i += sampleStep) {
+      const r = colorAttr.getX(i), g = colorAttr.getY(i), b = colorAttr.getZ(i);
+      if (r > 0.5 && r > g + 0.2 && r > b + 0.2) hasR = true;
+      if (g > 0.5 && g > r + 0.2 && g > b + 0.2) hasG = true;
+      if (b > 0.5 && b > r + 0.2 && b > g + 0.2) hasB = true;
+    }
+    if (!(hasR || hasG || hasB)) return null; // No painted colors detected
+
+    console.log(`✓ Blender vertex colors detected on ${mesh.name} (R=${hasR} G=${hasG} B=${hasB})`);
+
+    // Classify each vertex by dominant color channel
+    const vertexGroups = new Array(colorAttr.count);
+    for (let i = 0; i < colorAttr.count; i++) {
+      const r = colorAttr.getX(i), g = colorAttr.getY(i), b = colorAttr.getZ(i);
+      if (r >= g && r >= b)      vertexGroups[i] = groupNames[0]; // Red → first group
+      else if (g >= r && g >= b) vertexGroups[i] = groupNames[1]; // Green → second group
+      else                       vertexGroups[i] = groupNames[2]; // Blue → third group
+    }
+
+    mesh._vertexGroups = vertexGroups;
+    mesh._groupSet = [...new Set(vertexGroups)];
+
+    // Set up vertex colors for rendering (will be overwritten by applyActiveState)
+    const colors = new Float32Array(colorAttr.count * 3);
+    colors.fill(0.29);
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+    mesh.material = new THREE.MeshPhysicalMaterial({
+      vertexColors: true,
+      roughness: 0.42, metalness: 0.02,
+      clearcoat: 0.15, clearcoatRoughness: 0.4,
+      side: THREE.DoubleSide,
+    });
+
+    return {
+      mesh,
+      group: mesh._groupSet,
+      restMat: mesh.material,
+      isVertexPainted: true, // uses the vertex-color applyActiveState path
+    };
+  }
+
+  // Group name mappings for Blender vertex color reading
+  // Red → [0], Green → [1], Blue → [2]
+  const TORSO_VC_GROUPS = ['chest_upper', 'chest_lower', 'abs'];
+  const BACK_VC_GROUPS  = ['traps_upper', 'traps_lower', 'lats'];
+
+  // == Muscle inflation helper ==============================================
+  function inflateMesh(mesh, amount) {
+    const geo = mesh.geometry;
+    const pos = geo.attributes.position;
+    const norm = geo.attributes.normal;
+    if (!norm) return;
+    for (let i = 0; i < pos.count; i++) {
+      pos.setX(i, pos.getX(i) + norm.getX(i) * amount);
+      pos.setY(i, pos.getY(i) + norm.getY(i) * amount);
+      pos.setZ(i, pos.getZ(i) + norm.getZ(i) * amount);
+    }
+    pos.needsUpdate = true;
+    geo.computeVertexNormals();
+    geo.computeBoundingBox();
+    geo.computeBoundingSphere();
+  }
+
+  // Inflation amounts per sub-group
+  // CRITICAL: adjacent split groups MUST have EQUAL inflation to prevent
+  // physical overlap at boundaries (which causes visible color bleeding)
+  const INFLATE = {
+    chest_upper:0.002, chest_lower:0.002, abs:0.002,  // equal — no boundary overlap
+    delts_front:0.004, delts_side:0.004, delts_rear:0.004,
+    biceps:0.004, triceps:0.003, forearms:0.002, brachioradialis:0.002,
+    lats:0.002, traps_upper:0.002, traps_lower:0.002,  // equal — no boundary overlap
+    glutes:0.004, hamstrings:0.003,
+    quads:0.004, adductors:0.003,
+    calves_gastroc:0.003, calves_tibialis:0.002,
+  };
+
+  // == Traverse and classify ================================================
+  const splitQueue = [];
+  model.traverse(o => {
+    if (!o.isMesh) return;
+    o.geometry.computeVertexNormals();
+    o.castShadow = false;
+    o.receiveShadow = false;
+
+    const name = o.name || '';
+    if (SKELETON_NAMES.includes(name)) {
+      o.visible = false;
+      o.material = baseMat.clone();
+      allMeshes.push({ mesh: o, group: null, hidden: true, restMat: o.material });
+    } else if (isSplitMesh(name)) {
+      splitQueue.push(o);
+    } else {
+      o.material = baseMat.clone();
+      const group = MESH_GROUP_MAP[name] || null;
+
+      // Hide cosmetic meshes — no muscle group
+      const hidden = (name === 'Object_15' || name === 'Object_21');
+
+      allMeshes.push({ mesh: o, group, restMat: o.material, hidden });
+      if (group && !hidden) {
+        const groups = Array.isArray(group) ? group : [group];
+        const amt = Math.max(...groups.map(g => INFLATE[g] || 0));
+        if (amt > 0) inflateMesh(o, amt);
+      }
+    }
+  });
+
+  // == Perform vertex-level splits ==========================================
+  //
+  // Split thresholds derived from anatomical study cross-referenced with
+  // actual mesh world-space vertex coordinate ranges:
+  //
+  // Object_23 (front torso, Y 0.917..1.523):
+  //   - abs: Y < 1.25 (below 6th rib / pectoralis lower border)
+  //   - chest_lower: 1.25 <= Y < 1.43 (sternocostal head, up to clavicular split)
+  //   - chest_upper: Y >= 1.43 (clavicular head, above nipple line ~1.39)
+  //   Anatomical basis: pec major lower border at 6th rib ~Y=1.25,
+  //   clavicular/sternocostal split at ~2nd-3rd rib level ~Y=1.43
+  //
+  // Object_33 (upper arms, Y 1.136..1.500, Z -0.153..-0.012):
+  //   - triceps: Z < -0.075 (posterior arm)
+  //   - biceps: Z >= -0.075 (anterior arm)
+  //   Anatomical basis: biceps are anterior, triceps posterior.
+  //   Z center of mesh = -0.0825, shifted slightly anterior for larger triceps mass.
+  //
+  // Object_5 (deltoids, Y 1.323..1.526, Z -0.150..0.012):
+  //   - delts_rear: Z < -0.115 (posterior deltoid)
+  //   - delts_side: -0.115 <= Z < -0.025 (lateral deltoid)
+  //   - delts_front: Z >= -0.025 (anterior deltoid)
+  //   Anatomical basis: 3 heads wrap around shoulder. Z depth = 0.162,
+  //   center = -0.069. Splits at center +/- ~30% of depth.
+  //
+  // Object_13 (back muscles, Y 1.004..1.692):
+  //   - lats: Y < 1.25 (latissimus dorsi, lower back)
+  //   - traps_lower: 1.25 <= Y < 1.45 (lower+mid trapezius, T1-T12 region)
+  //   - traps_upper: Y >= 1.45 (upper trapezius, C1-C7 to acromion)
+  //   Anatomical basis: lats originate T6-sacrum, insert at humerus.
+  //   Traps upper/mid boundary at ~acromion level Y=1.52, simplified to
+  //   upper(>1.45) and lower(1.25-1.45). Lats below T6 level ~Y=1.25.
+  //
+  // == Centroid-based classification for individual muscle sub-meshes ==
+  // Each Object_13xxx / Object_23xxx is a single muscle — classify by position.
+  const _box = new THREE.Box3();
+  const _center = new THREE.Vector3();
+  const _size = new THREE.Vector3();
+
+  function classifyTorsoMesh(mesh) {
+    _box.setFromObject(mesh);
+    _box.getCenter(_center);
+    const cy = _center.y;
+    // Upper chest (clavicular pec head): near clavicle/neck
+    if (cy > 1.45) return 'chest_upper';
+    // Lower chest (sternocostal pec): main pec region
+    if (cy > 1.30) return 'chest_lower';
+    // Abs / core: obliques, rectus abdominis, serratus
+    return 'abs';
+  }
+
+  function classifyBackMesh(mesh) {
+    _box.setFromObject(mesh);
+    _box.getCenter(_center);
+    const cy = _center.y;
+    // Upper traps: near neck/shoulders (shrug muscles)
+    if (cy > 1.55) return 'traps_upper';
+    // Lower/mid traps: upper-mid back (diamond shape down to ~T12)
+    if (cy > 1.35) return 'traps_lower';
+    // Lats: lower back
+    return 'lats';
+  }
+
+  for (const m of splitQueue) {
+    let entries = [];
+    const isTorsoMesh = /^Object_23/.test(m.name);
+    const isBackMesh  = /^Object_13/.test(m.name);
+
+    if (isTorsoMesh) {
+      const group = classifyTorsoMesh(m);
+      m.material = baseMat.clone();
+      allMeshes.push({ mesh: m, group, restMat: m.material });
+      continue;
+    } else if (isBackMesh) {
+      const group = classifyBackMesh(m);
+      m.material = baseMat.clone();
+      allMeshes.push({ mesh: m, group, restMat: m.material });
+      continue;
+    } else if (m.name === 'Object_31') {
+      // Forearms -> brachioradialis (upper/proximal) / forearms (lower/distal)
+      entries = multiSplitMesh(m, 'y', [1.05], ['forearms', 'brachioradialis']);
+    } else if (m.name === 'Object_33') {
+      // Upper arms -> triceps (posterior) / biceps (anterior)
+      entries = multiSplitMesh(m, 'z', [-0.085], ['triceps', 'biceps']);
+    } else if (m.name === 'Object_5') {
+      // Deltoids -> rear / side / front
+      entries = multiSplitMesh(m, 'z', [-0.105, -0.045], ['delts_rear', 'delts_side', 'delts_front']);
+    }
+    for (const e of entries) {
+      const amt = INFLATE[e.group] || 0;
+      if (amt > 0) inflateMesh(e.mesh, amt);
+    }
+    allMeshes.push(...entries);
+    allMeshes.push({ mesh: m, group: null, hidden: true, restMat: baseMat.clone() });
+  }
+
+  scene.add(model);
+
+  // Floor
+  addFloor(-0.001);
+
+  // Camera -- front view
+  const midY = finalH * 0.47;
+  const dist = finalH * 1.4;
+  camera.position.set(0, midY, dist);
+  controls.target.set(0, midY, 0);
+  controls.update();
+
+  defaultCamPos.set(0, midY, dist);
+  defaultCamTarget.set(0, midY, 0);
+
+  // Debug logging
+  console.log('Ecorche loaded:', allMeshes.length, 'meshes');
+  const groups = {};
+  for (const e of allMeshes) {
+    const g = Array.isArray(e.group) ? e.group.join('+') : (e.group || (e.hidden ? 'HIDDEN' : 'none'));
+    groups[g] = (groups[g] || 0) + 1;
+  }
+  console.table(groups);
+
+  _viewerReady = true;
+  // Notify React Native that the viewer is ready
+  if (window.ReactNativeWebView) {
+    window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'ready' }));
+  }
+  if (_pendingMessage) { handleMessage(_pendingMessage); _pendingMessage = null; }
+
+}, undefined, (err) => {
+  console.error('Failed to load ecorche:', err);
+  document.getElementById('loading').textContent = 'FEL VID LADDNING';
+});
+
+// Debug exposure
+window.THREE = THREE;
+window._dbg = { scene, allMeshes, camera, controls };
+
+// == Render loop with slow auto-rotate ======================================
+let autoRotate = true;
+controls.addEventListener('start', () => { autoRotate = false; });
+controls.addEventListener('end', () => { setTimeout(() => { autoRotate = true; }, 3000); });
+
+(function animate() {
+  requestAnimationFrame(animate);
+  if (autoRotate) {
+    const t = performance.now() * 0.0001;
+    const radius = camera.position.distanceTo(controls.target);
+    camera.position.x = Math.sin(t) * radius * 0.3;
+    camera.position.z = Math.cos(t) * radius;
+  }
+  controls.update();
+  renderer.render(scene, camera);
+})();
+
+// == React Native WebView bridge ============================================
+let _viewerReady = false;
+let _pendingMessage = null;
+
+function handleMessage(rawData) {
+  try {
+    const data = typeof rawData === 'string' ? JSON.parse(rawData) : rawData;
+    if (data.type === 'highlight') {
+      window.clearAll();
+      (data.groups || []).forEach(gk => {
+        if (MUSCLE_HIERARCHY[gk]) window.toggleGroup(gk);
+      });
+    } else if (data.type === 'clear') {
+      window.clearAll();
+    } else if (data.type === 'resetCamera') {
+      window.resetCam();
+    }
+  } catch (e) {
+    console.error('Message parse error:', e);
+  }
+}
+
+// Listen for messages from React Native
+window.addEventListener('message', (e) => handleMessage(e.data));
+document.addEventListener('message', (e) => handleMessage(e.data));
+</script>
+</body>
+</html>
