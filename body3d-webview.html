@@ -12,10 +12,27 @@
       position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
       color:#00E5FF; font-size:11px; letter-spacing:3px; text-align:center; line-height:2;
     }
+    #view-btns {
+      position:absolute; bottom:10px; left:50%; transform:translateX(-50%);
+      display:flex; gap:6px; z-index:10;
+    }
+    #view-btns button {
+      background:rgba(14,14,30,0.85); border:1px solid #222238; color:#556;
+      padding:5px 14px; border-radius:16px; cursor:pointer;
+      font-size:9px; font-weight:800; letter-spacing:1.5px;
+      backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
+      transition:all .2s; touch-action:manipulation;
+    }
+    #view-btns button.active { color:#00E5FF; border-color:#00E5FF55; background:rgba(0,229,255,0.08); }
   </style>
 </head>
 <body>
 <div id="loading">LADDAR ECORCHE-MODELL...</div>
+<div id="view-btns" style="display:none">
+  <button id="vb-front" onclick="goView('front')">FRAM</button>
+  <button id="vb-back" onclick="goView('back')">BAK</button>
+  <button id="vb-left" onclick="goView('left')">SIDA</button>
+</div>
 
 <script type="importmap">
 {
@@ -48,8 +65,11 @@ const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerH
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
-controls.minDistance   = 0.3;
-controls.maxDistance   = 10;
+controls.enableZoom    = false;
+controls.enablePan     = false;
+controls.minPolarAngle = Math.PI * 0.25;
+controls.maxPolarAngle = Math.PI * 0.75;
+controls.rotateSpeed   = 0.5;
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -851,12 +871,18 @@ loader.load('Test2.glb', (gltf) => {
   // Camera -- front view
   const midY = finalH * 0.47;
   const dist = finalH * 1.4;
+  _midY = midY;
+  _dist = dist;
   camera.position.set(0, midY, dist);
   controls.target.set(0, midY, 0);
   controls.update();
 
   defaultCamPos.set(0, midY, dist);
   defaultCamTarget.set(0, midY, 0);
+
+  // Show view buttons
+  document.getElementById('view-btns').style.display = 'flex';
+  document.getElementById('vb-front').classList.add('active');
 
   // Debug logging
   console.log('Ecorche loaded:', allMeshes.length, 'meshes');
@@ -883,19 +909,61 @@ loader.load('Test2.glb', (gltf) => {
 window.THREE = THREE;
 window._dbg = { scene, allMeshes, camera, controls };
 
-// == Render loop with slow auto-rotate ======================================
+// == Smooth camera views ====================================================
+let _camTarget = null; // { pos: Vector3, target: Vector3 }
+let _midY = 0;
+let _dist = 0;
+let _currentView = 'front';
+
+const VIEW_ANGLES = {
+  front: { angle: 0 },
+  back:  { angle: Math.PI },
+  left:  { angle: Math.PI * 0.5 },
+};
+
+window.goView = function(view) {
+  if (!_dist) return;
+  const v = VIEW_ANGLES[view];
+  if (!v) return;
+  _currentView = view;
+  _camTarget = {
+    pos: new THREE.Vector3(Math.sin(v.angle) * _dist, _midY, Math.cos(v.angle) * _dist),
+    target: new THREE.Vector3(0, _midY, 0),
+  };
+  // Update button active states
+  document.querySelectorAll('#view-btns button').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('vb-' + view);
+  if (btn) btn.classList.add('active');
+};
+
+// == Render loop with smooth transitions ====================================
 let autoRotate = true;
-controls.addEventListener('start', () => { autoRotate = false; });
-controls.addEventListener('end', () => { setTimeout(() => { autoRotate = true; }, 3000); });
+let userTouching = false;
+controls.addEventListener('start', () => { userTouching = true; autoRotate = false; _camTarget = null; });
+controls.addEventListener('end', () => { userTouching = false; setTimeout(() => { if (!userTouching) autoRotate = true; }, 4000); });
 
 (function animate() {
   requestAnimationFrame(animate);
-  if (autoRotate) {
-    const t = performance.now() * 0.0001;
-    const radius = camera.position.distanceTo(controls.target);
-    camera.position.x = Math.sin(t) * radius * 0.3;
-    camera.position.z = Math.cos(t) * radius;
+
+  // Smooth camera lerp to target view
+  if (_camTarget) {
+    camera.position.lerp(_camTarget.pos, 0.06);
+    controls.target.lerp(_camTarget.target, 0.06);
+    if (camera.position.distanceTo(_camTarget.pos) < 0.005) {
+      camera.position.copy(_camTarget.pos);
+      controls.target.copy(_camTarget.target);
+      _camTarget = null;
+    }
   }
+  // Gentle auto-rotate when idle
+  else if (autoRotate && _dist) {
+    const t = performance.now() * 0.00006;
+    camera.position.x = Math.sin(t) * _dist * 0.25;
+    camera.position.z = Math.cos(t) * _dist;
+    camera.position.y = _midY;
+    controls.target.set(0, _midY, 0);
+  }
+
   controls.update();
   renderer.render(scene, camera);
 })();
