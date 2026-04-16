@@ -915,59 +915,104 @@ window._dbg = { scene, allMeshes, camera, controls };
 let _animActive = false;
 let _animExercise = null;
 let _animStartTime = 0;
-let _forearmPivot = null;   // THREE.Group wrapping right forearm meshes
-let _forearmMeshes = [];    // original meshes that were re-parented
+let _forearmPivotL = null;  // pivot for left arm
+let _forearmPivotR = null;  // pivot for right arm
 
-// Build forearm pivot for curl animation.
-// Strategy: pick the RIGHT-side forearm + brachioradialis split meshes
-// (world X < 0 in most rigs — we'll detect from bounding box). Re-parent
-// them into a pivot group centered at elbow position.
+// Split a mesh's geometry by world-space X threshold, returning two new meshes
+// (left side with X < threshold, right side with X > threshold).
+function splitMeshByX(mesh, threshold) {
+  const geo = mesh.geometry;
+  const pos = geo.attributes.position;
+  const idx = geo.index;
+  const faceCount = idx ? idx.count / 3 : pos.count / 3;
+
+  const worldV = new THREE.Vector3();
+  const vals = new Float32Array(pos.count);
+  mesh.updateMatrixWorld(true);
+  for (let i = 0; i < pos.count; i++) {
+    worldV.set(pos.getX(i), pos.getY(i), pos.getZ(i));
+    worldV.applyMatrix4(mesh.matrixWorld);
+    vals[i] = worldV.x;
+  }
+
+  const leftIdx = [], rightIdx = [];
+  for (let f = 0; f < faceCount; f++) {
+    const a = idx ? idx.getX(f*3)   : f*3;
+    const b = idx ? idx.getX(f*3+1) : f*3+1;
+    const c = idx ? idx.getX(f*3+2) : f*3+2;
+    const avg = (vals[a] + vals[b] + vals[c]) / 3;
+    if (avg > threshold) rightIdx.push(a, b, c);
+    else leftIdx.push(a, b, c);
+  }
+
+  const makeChild = (indices) => {
+    if (indices.length === 0) return null;
+    const geoR = geo.clone();
+    geoR.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
+    const child = new THREE.Mesh(geoR, mesh.material.clone());
+    child.matrix.copy(mesh.matrixWorld);
+    child.matrixAutoUpdate = true;
+    child.matrix.decompose(child.position, child.quaternion, child.scale);
+    return child;
+  };
+
+  return { left: makeChild(leftIdx), right: makeChild(rightIdx) };
+}
+
+// Build two forearm pivots (one per arm) for curl animation.
 function setupForearmPivot() {
-  if (_forearmPivot) return; // already built
+  if (_forearmPivotL) return; // already built
 
-  // Find forearm/brachioradialis meshes on one side
   const candidates = allMeshes.filter(e =>
     e.group === 'forearms' || e.group === 'brachioradialis'
   );
-  if (candidates.length === 0) { console.warn('No forearm meshes'); return; }
+  if (candidates.length === 0) { console.warn('[anim] No forearm meshes'); return; }
 
-  // Compute per-mesh centroid x to find the two sides
-  const withCentroids = candidates.map(e => {
-    const b = new THREE.Box3().setFromObject(e.mesh);
-    const c = b.getCenter(new THREE.Vector3());
-    return { entry: e, cx: c.x, box: b };
+  // Split model at X=0 (midline). For each forearm/brachio mesh, create L/R copies.
+  const leftParts = [];
+  const rightParts = [];
+  candidates.forEach(e => {
+    const split = splitMeshByX(e.mesh, 0);
+    if (split.left)  leftParts.push({ mesh: split.left,  group: e.group });
+    if (split.right) rightParts.push({ mesh: split.right, group: e.group });
+    // Hide original
+    e.hidden = true;
+    e.mesh.visible = false;
   });
 
-  // Right side = larger X (user's right, our left when facing model is positive X in many rigs)
-  const maxX = Math.max(...withCentroids.map(w => w.cx));
-  const rightSide = withCentroids.filter(w => w.cx > maxX * 0.5);
-  if (rightSide.length === 0) return;
+  if (leftParts.length === 0 || rightParts.length === 0) {
+    console.warn('[anim] L/R split produced empty side', leftParts.length, rightParts.length);
+    return;
+  }
 
-  // Elbow pivot = top of forearm bbox (maximum Y across right-side meshes)
-  const overallBox = new THREE.Box3();
-  rightSide.forEach(w => overallBox.union(w.box));
-  const elbow = new THREE.Vector3(
-    (overallBox.min.x + overallBox.max.x) / 2,
-    overallBox.max.y,
-    (overallBox.min.z + overallBox.max.z) / 2
-  );
+  // Compute pivot (elbow) position per side
+  const makePivot = (parts) => {
+    const bb = new THREE.Box3();
+    parts.forEach(p => bb.expandByObject(p.mesh));
+    const elbow = new THREE.Vector3(
+      (bb.min.x + bb.max.x) / 2,
+      bb.max.y - 0.01, // just below top to avoid clipping
+      (bb.min.z + bb.max.z) / 2
+    );
+    const pivot = new THREE.Group();
+    pivot.position.copy(elbow);
+    scene.add(pivot);
+    // Attach each part maintaining world transform
+    parts.forEach(p => {
+      scene.add(p.mesh);       // first put in scene
+      pivot.attach(p.mesh);    // then into pivot preserving world pos
+      // Register in allMeshes so pulse/color logic sees it
+      allMeshes.push({ mesh: p.mesh, group: p.group, restMat: p.mesh.material });
+    });
+    return pivot;
+  };
 
-  // Build pivot group at elbow
-  const pivot = new THREE.Group();
-  pivot.position.copy(elbow);
-  scene.add(pivot);
+  _forearmPivotL = makePivot(leftParts);
+  _forearmPivotR = makePivot(rightParts);
 
-  // Re-parent each mesh into pivot, preserving world transform
-  rightSide.forEach(w => {
-    const m = w.entry.mesh;
-    m.matrixAutoUpdate = true; // was frozen for split meshes
-    scene.attach(m); // moves to scene keeping world transform
-    pivot.attach(m); // moves to pivot keeping world transform
-    _forearmMeshes.push(m);
-  });
-
-  _forearmPivot = pivot;
-  console.log('Forearm pivot built at', elbow, 'meshes:', _forearmMeshes.length);
+  console.log('[anim] Pivots built. L elbow:', _forearmPivotL.position,
+              'R elbow:', _forearmPivotR.position,
+              'L parts:', leftParts.length, 'R parts:', rightParts.length);
 }
 
 // Apply a pulsing color to a group (temporarily overrides material).
@@ -991,9 +1036,8 @@ function setGroupPulse(groupKey, intensity) {
 }
 
 function restoreFromAnim() {
-  // Restore forearm rotation
-  if (_forearmPivot) _forearmPivot.rotation.x = 0;
-  // Restore all materials via normal state logic
+  if (_forearmPivotL) _forearmPivotL.rotation.x = 0;
+  if (_forearmPivotR) _forearmPivotR.rotation.x = 0;
   applyActiveState();
 }
 
@@ -1036,7 +1080,8 @@ function updateAnimation(nowMs) {
       const p = (phase - 0.55) / 0.45;
       angle = 2.44 * (1 - Math.sin(p * Math.PI / 2));
     }
-    if (_forearmPivot) _forearmPivot.rotation.x = -angle;
+    if (_forearmPivotL) _forearmPivotL.rotation.x = -angle;
+    if (_forearmPivotR) _forearmPivotR.rotation.x = -angle;
 
     // Biceps intensity follows contraction (high near top)
     const intensity = Math.sin(phase * Math.PI); // 0..1..0 over rep
