@@ -32,6 +32,7 @@
   <button id="vb-front" onclick="goView('front')">FRAM</button>
   <button id="vb-back" onclick="goView('back')">BAK</button>
   <button id="vb-left" onclick="goView('left')">SIDA</button>
+  <button id="vb-anim" onclick="toggleAnim()">ANIMERA</button>
 </div>
 
 <script type="importmap">
@@ -909,6 +910,141 @@ loader.load('Test2.glb', (gltf) => {
 window.THREE = THREE;
 window._dbg = { scene, allMeshes, camera, controls };
 
+// == Animation system =======================================================
+// Currently supports: 'biceps_curl' — pulses biceps + rotates forearm mesh
+let _animActive = false;
+let _animExercise = null;
+let _animStartTime = 0;
+let _forearmPivot = null;   // THREE.Group wrapping right forearm meshes
+let _forearmMeshes = [];    // original meshes that were re-parented
+
+// Build forearm pivot for curl animation.
+// Strategy: pick the RIGHT-side forearm + brachioradialis split meshes
+// (world X < 0 in most rigs — we'll detect from bounding box). Re-parent
+// them into a pivot group centered at elbow position.
+function setupForearmPivot() {
+  if (_forearmPivot) return; // already built
+
+  // Find forearm/brachioradialis meshes on one side
+  const candidates = allMeshes.filter(e =>
+    e.group === 'forearms' || e.group === 'brachioradialis'
+  );
+  if (candidates.length === 0) { console.warn('No forearm meshes'); return; }
+
+  // Compute per-mesh centroid x to find the two sides
+  const withCentroids = candidates.map(e => {
+    const b = new THREE.Box3().setFromObject(e.mesh);
+    const c = b.getCenter(new THREE.Vector3());
+    return { entry: e, cx: c.x, box: b };
+  });
+
+  // Right side = larger X (user's right, our left when facing model is positive X in many rigs)
+  const maxX = Math.max(...withCentroids.map(w => w.cx));
+  const rightSide = withCentroids.filter(w => w.cx > maxX * 0.5);
+  if (rightSide.length === 0) return;
+
+  // Elbow pivot = top of forearm bbox (maximum Y across right-side meshes)
+  const overallBox = new THREE.Box3();
+  rightSide.forEach(w => overallBox.union(w.box));
+  const elbow = new THREE.Vector3(
+    (overallBox.min.x + overallBox.max.x) / 2,
+    overallBox.max.y,
+    (overallBox.min.z + overallBox.max.z) / 2
+  );
+
+  // Build pivot group at elbow
+  const pivot = new THREE.Group();
+  pivot.position.copy(elbow);
+  scene.add(pivot);
+
+  // Re-parent each mesh into pivot, preserving world transform
+  rightSide.forEach(w => {
+    const m = w.entry.mesh;
+    m.matrixAutoUpdate = true; // was frozen for split meshes
+    scene.attach(m); // moves to scene keeping world transform
+    pivot.attach(m); // moves to pivot keeping world transform
+    _forearmMeshes.push(m);
+  });
+
+  _forearmPivot = pivot;
+  console.log('Forearm pivot built at', elbow, 'meshes:', _forearmMeshes.length);
+}
+
+// Apply a pulsing color to a group (temporarily overrides material).
+function setGroupPulse(groupKey, intensity) {
+  for (const entry of allMeshes) {
+    if (entry.hidden) continue;
+    const groups = Array.isArray(entry.group) ? entry.group : [entry.group];
+    if (!groups.includes(groupKey)) continue;
+    const base = GROUP_COLORS[groupKey] || new THREE.Color(0x00E5FF);
+    // Lerp emissive between dim (0) and bright (1) based on intensity
+    const col = base.clone().multiplyScalar(0.6 + intensity * 0.8);
+    entry.mesh.material = new THREE.MeshStandardMaterial({
+      color: col,
+      roughness: 0.38,
+      metalness: 0.08,
+      side: THREE.DoubleSide,
+      emissive: base,
+      emissiveIntensity: 0.15 + intensity * 1.2,
+    });
+  }
+}
+
+function restoreFromAnim() {
+  // Restore forearm rotation
+  if (_forearmPivot) _forearmPivot.rotation.x = 0;
+  // Restore all materials via normal state logic
+  applyActiveState();
+}
+
+window.toggleAnim = function() {
+  if (_animActive) {
+    _animActive = false;
+    restoreFromAnim();
+    document.getElementById('vb-anim').classList.remove('active');
+  } else {
+    setupForearmPivot();
+    _animActive = true;
+    _animExercise = 'biceps_curl';
+    _animStartTime = performance.now();
+    // Switch to side view for best visibility
+    goView('left');
+    document.getElementById('vb-anim').classList.add('active');
+  }
+};
+
+function updateAnimation(nowMs) {
+  if (!_animActive) return;
+  const t = (nowMs - _animStartTime) / 1000; // seconds
+  const period = 2.2; // seconds per rep
+  const phase = (t % period) / period; // 0..1
+
+  if (_animExercise === 'biceps_curl') {
+    // Rep cycle: 0.0 — arm extended (0°)
+    //            0.4 — top of curl (~140°)
+    //            0.55 — brief squeeze
+    //            1.0 — back to extended
+    let angle;
+    if (phase < 0.4) {
+      // Concentric: ease-out
+      const p = phase / 0.4;
+      angle = Math.sin(p * Math.PI / 2) * 2.44; // 0 → 140°
+    } else if (phase < 0.55) {
+      angle = 2.44; // hold
+    } else {
+      // Eccentric: slightly slower ease-in
+      const p = (phase - 0.55) / 0.45;
+      angle = 2.44 * (1 - Math.sin(p * Math.PI / 2));
+    }
+    if (_forearmPivot) _forearmPivot.rotation.x = -angle;
+
+    // Biceps intensity follows contraction (high near top)
+    const intensity = Math.sin(phase * Math.PI); // 0..1..0 over rep
+    setGroupPulse('biceps', intensity);
+    setGroupPulse('brachioradialis', intensity * 0.5);
+  }
+}
+
 // == Smooth camera views ====================================================
 let _camTarget = null; // { pos: Vector3, target: Vector3 }
 let _midY = 0;
@@ -944,6 +1080,7 @@ controls.addEventListener('end', () => { userTouching = false; setTimeout(() => 
 
 (function animate() {
   requestAnimationFrame(animate);
+  const now = performance.now();
 
   // Smooth camera lerp to target view
   if (_camTarget) {
@@ -956,13 +1093,17 @@ controls.addEventListener('end', () => { userTouching = false; setTimeout(() => 
     }
   }
   // Gentle auto-rotate when idle (constant distance, circular orbit)
-  else if (autoRotate && _dist) {
-    const t = performance.now() * 0.00006;
+  // — disabled during exercise animation for clarity
+  else if (autoRotate && _dist && !_animActive) {
+    const t = now * 0.00006;
     camera.position.x = Math.sin(t) * _dist;
     camera.position.z = Math.cos(t) * _dist;
     camera.position.y = _midY;
     controls.target.set(0, _midY, 0);
   }
+
+  // Exercise animation
+  updateAnimation(now);
 
   controls.update();
   renderer.render(scene, camera);
@@ -984,6 +1125,11 @@ function handleMessage(rawData) {
       window.clearAll();
     } else if (data.type === 'resetCamera') {
       window.resetCam();
+    } else if (data.type === 'animate') {
+      // Start exercise animation if not already running
+      if (!_animActive) window.toggleAnim();
+    } else if (data.type === 'stopAnimate') {
+      if (_animActive) window.toggleAnim();
     }
   } catch (e) {
     console.error('Message parse error:', e);
