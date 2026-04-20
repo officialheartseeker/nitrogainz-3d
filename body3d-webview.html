@@ -209,12 +209,12 @@ const activeSet      = new Set();   // active sub-group keys
 const activeGroups   = new Set();   // active main group keys
 
 // Pulse animation state: _pulseFactor 1.0 = fully bright, 0.25 = near dim
+// Endless pulse — runs continuously while muscles are highlighted
 let _pulseFactor = 1.0;
 let _pulseStartMs = 0;
 let _pulseRunning = false;
 let _lastPulseTick = 0;
-const PULSE_COUNT = 3;
-const PULSE_MS = 500;
+const PULSE_MS = 1000; // per-pulse duration (50% slower than before)
 
 function startPulse() {
   _pulseStartMs = performance.now();
@@ -222,15 +222,15 @@ function startPulse() {
   _pulseFactor = 0.25; // start at dip so first pulse is visible
 }
 
+function stopPulse() {
+  _pulseRunning = false;
+  _pulseFactor = 1.0;
+}
+
 function updatePulseTick(nowMs) {
   if (!_pulseRunning) return false;
   const elapsed = nowMs - _pulseStartMs;
-  const total = PULSE_COUNT * PULSE_MS;
-  if (elapsed >= total) {
-    _pulseFactor = 1.0;
-    _pulseRunning = false;
-    return true;
-  }
+  // Infinite loop — just modulo by PULSE_MS
   const localT = (elapsed % PULSE_MS) / PULSE_MS;
   const dip = 0.5 - 0.5 * Math.cos(localT * Math.PI * 2); // 0..1..0
   _pulseFactor = 1.0 - dip * 0.75; // 1.0 → 0.25 → 1.0
@@ -1217,10 +1217,12 @@ function handleMessage(rawData) {
       (data.groups || []).forEach(gk => {
         if (MUSCLE_HIERARCHY[gk]) window.toggleGroup(gk);
       });
-      // Trigger 3-pulse animation on newly highlighted muscles
+      // Start endless pulse while muscles are highlighted
       if ((data.groups || []).length > 0) startPulse();
+      else stopPulse();
     } else if (data.type === 'clear') {
       window.clearAll();
+      stopPulse();
     } else if (data.type === 'resetCamera') {
       window.resetCam();
     } else if (data.type === 'animate') {
