@@ -214,6 +214,7 @@ let _pulseFactor = 1.0;
 let _pulseStartMs = 0;
 let _pulseRunning = false;
 let _lastPulseTick = 0;
+const _primaryPulseSet = new Set(); // sub-group keys that should pulse (primary only)
 const PULSE_MS = 1000; // per-pulse duration (50% slower than before)
 
 function startPulse() {
@@ -297,10 +298,12 @@ function applyActiveState() {
           const g = vg[i];
           if (activeSet.has(g)) {
             const c = GROUP_COLORS[g] || new THREE.Color(0x00E5FF);
-            // Blend between dim and bright based on pulse factor
-            const r = DIM_R + (c.r - DIM_R) * pf;
-            const gC = DIM_G + (c.g - DIM_G) * pf;
-            const b = DIM_B + (c.b - DIM_B) * pf;
+            // Pulse ONLY primary muscles — secondary stay fully bright
+            const isPrimary = _primaryPulseSet.has(g);
+            const effPf = isPrimary ? pf : 1.0;
+            const r = DIM_R + (c.r - DIM_R) * effPf;
+            const gC = DIM_G + (c.g - DIM_G) * effPf;
+            const b = DIM_B + (c.b - DIM_B) * effPf;
             colAttr.setXYZ(i, r, gC, b);
           } else {
             colAttr.setXYZ(i, DIM_R, DIM_G, DIM_B);
@@ -355,8 +358,9 @@ function applyActiveState() {
         ? entry.group.find(g => activeSet.has(g))
         : entry.group;
       const col = GROUP_COLORS[matchedGroup] || new THREE.Color(0x00E5FF);
-      // Blend color with dim based on pulse factor
-      const pf = _pulseFactor;
+      // Pulse ONLY primary muscles — secondary stay fully bright
+      const isPrimary = _primaryPulseSet.has(matchedGroup);
+      const pf = isPrimary ? _pulseFactor : 1.0;
       const DIM = new THREE.Color(0x181e2a);
       const blended = new THREE.Color(
         DIM.r + (col.r - DIM.r) * pf,
@@ -1217,11 +1221,23 @@ function handleMessage(rawData) {
       (data.groups || []).forEach(gk => {
         if (MUSCLE_HIERARCHY[gk]) window.toggleGroup(gk);
       });
-      // Start endless pulse while muscles are highlighted
-      if ((data.groups || []).length > 0) startPulse();
+
+      // Build primary-pulse set: expand primary main-groups to their sub-group keys
+      _primaryPulseSet.clear();
+      const primaryMain = data.primaryGroups || data.groups || [];
+      primaryMain.forEach(gk => {
+        const hier = MUSCLE_HIERARCHY[gk];
+        if (hier) hier.subs.forEach(s => _primaryPulseSet.add(s));
+      });
+
+      // Pulse only if explicitly requested (default true for backward compat)
+      // Session/history views pass pulse:false → static highlight
+      const shouldPulse = data.pulse !== false;
+      if ((data.groups || []).length > 0 && shouldPulse) startPulse();
       else stopPulse();
     } else if (data.type === 'clear') {
       window.clearAll();
+      _primaryPulseSet.clear();
       stopPulse();
     } else if (data.type === 'resetCamera') {
       window.resetCam();
